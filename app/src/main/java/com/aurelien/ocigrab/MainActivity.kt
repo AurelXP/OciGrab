@@ -156,6 +156,7 @@ private enum class Kind { PRIMARY, SECONDARY, DANGER }
 class MainActivity : Activity() {
 
     private val REQ_EXPORT = 42
+    private val REQ_IMPORT = 43
     private val LAST = 4
     private val stepNames = listOf("Compte", "Machine", "SSH", "Protection", "Recherche")
     private val stepTitles = listOf(
@@ -177,7 +178,7 @@ class MainActivity : Activity() {
     private val edits = mutableMapOf<String, EditText>()
     private var ready = false
     private var current = 0
-    private var connecting = false
+    @Volatile private var connecting = false
     @Volatile private var connError = ""
     private var pendingContent = ""
     private var pendingName = ""
@@ -219,6 +220,11 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun ui(block: () -> Unit) = runOnUiThread { block() }
+
+    // N'écrit que si le texte change : sinon la sélection (copier l'IP, le journal) saute chaque seconde.
+    private var TextView.value: String
+        get() = text.toString()
+        set(v) { if (text.toString() != v) text = v }
     private fun txt(k: String) = edits[k]?.text?.toString()?.trim() ?: ""
 
     private fun bg(label: String, block: () -> Unit) {
@@ -275,7 +281,7 @@ class MainActivity : Activity() {
 
     private fun field(
         parent: LinearLayout, key: String, label: String, hint: String,
-        def: String = "", multiline: Boolean = false, mono: Boolean = false
+        def: String = "", multiline: Boolean = false, mono: Boolean = false, numeric: Boolean = false
     ): EditText {
         caption(parent, label)
         val e = EditText(this).apply {
@@ -288,12 +294,13 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(10), dp(12), dp(10))
             if (mono) typeface = Typeface.MONOSPACE
             if (multiline) {
-                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
                 minLines = 2
                 maxLines = 5
                 gravity = Gravity.TOP
             } else {
-                inputType = InputType.TYPE_CLASS_TEXT
+                inputType = if (numeric) InputType.TYPE_CLASS_NUMBER
+                else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
                 setSingleLine(true)
             }
             addTextChangedListener(object : TextWatcher {
@@ -360,6 +367,31 @@ class MainActivity : Activity() {
             setPadding(dp(10), dp(10), dp(10), dp(10))
         }
 
+    /** Lit « user=… tenancy=… fingerprint=… region=… » (aperçu du fichier de config Oracle) dans le presse-papiers. */
+    private fun pasteOracleConfig() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val t = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString() ?: ""
+        val found = mutableListOf<String>()
+        for (k in listOf("tenancy", "user", "fingerprint", "region")) {
+            val m = Regex("(?:^|\\s)$k\\s*=\\s*(\\S+)").find(t) ?: continue
+            edits[k]?.setText(m.groupValues[1])
+            found.add(k)
+        }
+        val msg = if (found.isEmpty())
+            "Rien de reconnu : copie d'abord l'aperçu du fichier de configuration dans la console Oracle."
+        else
+            "Rempli : " + found.joinToString(", ") + ". Ajoute maintenant la clé privée."
+        AppLog.add(msg)
+        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+    }
+
+    private fun importPem() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+        startActivityForResult(i, REQ_IMPORT)
+    }
+
     private fun copy(text: String) {
         if (text.isBlank()) return
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -385,6 +417,33 @@ class MainActivity : Activity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_IMPORT && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            try {
+                val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { r ->
+                    val buf = CharArray(20000)
+                    val n = r.read(buf)
+                    String(buf, 0, maxOf(n, 0))
+                } ?: ""
+                if (!text.contains("PRIVATE KEY")) {
+                    Toast.makeText(this, "Ce fichier ne contient pas de clé privée", Toast.LENGTH_LONG).show()
+                    return
+                }
+                val pub = KeyUtil.publicPemOfPrivatePem(text)
+                val fp = KeyUtil.fingerprintOfPrivatePem(text)
+                edits["key"]?.setText(text.trim())
+                edits["fingerprint"]?.setText(fp)
+                apiPubView.text = pub
+                Store.put(this, "api_pub", pub)
+                AppLog.add("Clé privée importée. Empreinte : $fp")
+                Toast.makeText(this, "Clé importée. Empreinte : $fp", Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                val msg = "Clé illisible : ${e.message ?: e.javaClass.simpleName}"
+                AppLog.add(msg)
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
+            return
+        }
         if (requestCode == REQ_EXPORT && resultCode == RESULT_OK) {
             val uri = data?.data ?: return
             try {
@@ -466,6 +525,7 @@ class MainActivity : Activity() {
             val cell = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER_HORIZONTAL
+                contentDescription = "Étape ${i + 1} : ${stepNames[i]}"
                 setOnClickListener { goTo(i) }
             }
             val top = FrameLayout(this)
@@ -514,11 +574,13 @@ class MainActivity : Activity() {
         btn(r1, "Télécharger") { export("oci_api_public.pem", apiPubView.text.toString()) }
 
         val c2 = card(s, "2 · Colle tes identifiants", "Tu les trouves dans la console Oracle (profil et locataire).")
+        btn(c2, "📋 Coller la config Oracle (presse-papiers)") { pasteOracleConfig() }
         field(c2, "tenancy", "Tenancy OCID", "ocid1.tenancy.oc1..…", mono = true)
         field(c2, "user", "User OCID", "ocid1.user.oc1..…", mono = true)
         field(c2, "region", "Région", "eu-paris-1")
         field(c2, "fingerprint", "Empreinte de la clé API", "Remplie automatiquement", mono = true)
         field(c2, "key", "Clé privée API (PEM)", "-----BEGIN PRIVATE KEY-----", multiline = true, mono = true)
+        btn(c2, "📂 Importer un fichier de clé privée (.pem)") { importPem() }
         btn(c2, "Sauvegarder la clé privée") { export("oci_api_private.pem", txt("key")) }
         field(c2, "compartment", "Compartiment (optionnel)", "Vide = racine du locataire", mono = true)
 
@@ -579,9 +641,9 @@ class MainActivity : Activity() {
         renderPresets()
 
         val c4 = card(s, "Stockage et nom")
-        field(c4, "boot", "Disque de démarrage (Go)", "47 à 200", "50")
+        field(c4, "boot", "Disque de démarrage (Go)", "47 à 200", "50", numeric = true)
         field(c4, "name", "Nom de l'instance", "arm-free", "arm-free")
-        field(c4, "interval", "Délai entre deux tentatives (secondes)", "10 minimum", "60")
+        field(c4, "interval", "Délai entre deux tentatives (secondes)", "10 minimum", "60", numeric = true)
 
         adSp.set(Store.loadOpts(this, "cache_ad"))
         subnetSp.set(Store.loadOpts(this, "cache_subnet"))
@@ -1079,14 +1141,14 @@ class MainActivity : Activity() {
 
         // étape Compte
         val connected = Store.get(this, "connected_sig") == currentSig() && txt("key").isNotEmpty()
-        connBadge.text = when {
+        connBadge.value = when {
             connecting -> "● Connexion en cours…"
             connected -> "● Connecté"
             else -> "● Non connecté"
         }
         connBadge.setTextColor(if (connecting) Ui.WARN else if (connected) Ui.OK else Ui.MUTED)
         val err = connError
-        connInfo.text = when {
+        connInfo.value = when {
             connected -> "${adSp.opts.size} domaine(s) · ${allImages.size} système(s) · ${subnetSp.opts.size} sous-réseau(x)"
             err.isNotEmpty() && !connecting -> err
             else -> ""
@@ -1103,28 +1165,28 @@ class MainActivity : Activity() {
 
         // étape Protection
         val bat = batteryOk()
-        batteryView.text = if (bat) "● Autorisé" else "● Non autorisé"
+        batteryView.value = if (bat) "● Autorisé" else "● Non autorisé"
         batteryView.setTextColor(if (bat) Ui.OK else Ui.WARN)
         val adm = dpm().isAdminActive(adminComp())
-        adminView.text = if (adm) "● Actif" else "● Inactif"
+        adminView.value = if (adm) "● Actif" else "● Inactif"
         adminView.setTextColor(if (adm) Ui.OK else Ui.MUTED)
 
         // étape Recherche
         val img = imageSp.selected()
-        summaryView.text = "Région : ${txt("region")}\n" +
+        summaryView.value = "Région : ${txt("region")}\n" +
             "Système : ${img?.label ?: "-"}\n" +
             "Puissance : ${preset + 1} cœur(s) · ${6 * (preset + 1)} Go de RAM\n" +
             "Disque : ${txt("boot")} Go · nom : ${txt("name")}\n" +
             "Nouvel essai toutes les ${txt("interval")} s"
-        statusTitle.text = if (running) "● Recherche en cours" else "● Recherche à l'arrêt"
+        statusTitle.value = if (running) "● Recherche en cours" else "● Recherche à l'arrêt"
         statusTitle.setTextColor(if (running) Ui.OK else Ui.MUTED)
-        statusDetail.text = if (running) "Essai n°${GrabState.attempts} · ${GrabState.status}" else "Prête à démarrer."
+        statusDetail.value = if (running) "Essai n°${GrabState.attempts} · ${GrabState.status}" else "Prête à démarrer."
         enable(btnStart, !running)
         enable(btnStop, running)
         val cmd = sshCommand()
-        ipView.text = if (cmd.isEmpty()) "Aucune machine obtenue pour l'instant."
+        ipView.value = if (cmd.isEmpty()) "Aucune machine obtenue pour l'instant."
         else "IP : ${Store.get(this, "last_ip")}\n$cmd"
-        logView.text = AppLog.text().ifEmpty { "Rien pour l'instant." }
+        logView.value = AppLog.text().ifEmpty { "Rien pour l'instant." }
 
         // Si une étape déjà passée devient invalide, on revient dessus.
         if (!running) {

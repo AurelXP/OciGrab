@@ -79,8 +79,11 @@ object KeyUtil {
     }
 
     fun loadPrivate(pem: String): PrivateKey {
+        require(!pem.contains("ENCRYPTED")) { "clé chiffrée par mot de passe : génère-en une sans passphrase" }
+        require(!pem.contains("BEGIN OPENSSH PRIVATE KEY")) { "format OpenSSH non géré : utilise une clé PEM (BEGIN RSA PRIVATE KEY)" }
         val isPkcs1 = pem.contains("BEGIN RSA PRIVATE KEY")
-        val b64 = pem.lines().filter { !it.startsWith("-----") }.joinToString("").replace("\\s".toRegex(), "")
+        val b64 = pem.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("-----") }
+            .joinToString("").replace("\\s".toRegex(), "")
         var bytes = Base64.decode(b64, Base64.DEFAULT)
         if (isPkcs1) bytes = wrapPkcs1(bytes)
         return KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(bytes))

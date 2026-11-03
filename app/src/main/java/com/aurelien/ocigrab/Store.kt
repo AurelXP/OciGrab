@@ -78,7 +78,7 @@ object Store {
             user = get(c, "user").trim(),
             fingerprint = fp,
             privateKeyPem = pem,
-            region = get(c, "region").trim(),
+            region = get(c, "region").trim().lowercase(Locale.ROOT),
             compartment = get(c, "compartment").trim().ifEmpty { tenancy },
             availabilityDomain = get(c, "ad").trim(),
             subnet = get(c, "subnet").trim(),

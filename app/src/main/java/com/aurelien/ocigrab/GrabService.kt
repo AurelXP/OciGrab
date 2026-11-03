@@ -27,6 +27,9 @@ class GrabService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var worker: Thread? = null
 
+    // Numéro de la recherche en cours : un ancien worker qui se termine ne touche pas à la nouvelle.
+    @Volatile private var gen = 0
+
     // Toutes les secondes : vérifie que la notification est bien là, la remet sinon, et la met à jour
     private val ticker = object : Runnable {
         override fun run() {
@@ -41,6 +44,7 @@ class GrabService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "STOP") {
             GrabState.running = false
+            gen++
             handler.removeCallbacks(ticker)
             worker?.interrupt()
             AppLog.add("Arrêté manuellement")
@@ -49,13 +53,25 @@ class GrabService : Service() {
             return START_NOT_STICKY
         }
         createChannels()
-        startFg(buildNotif("Recherche d'une machine…", true))
+        try {
+            startFg(buildNotif("Recherche d'une machine…", true))
+        } catch (e: Exception) {
+            // Android 12+ refuse parfois le passage au premier plan depuis l'arrière-plan
+            AppLog.add("Impossible de passer au premier plan : ${e.javaClass.simpleName}. Ouvre l'appli puis relance la recherche.")
+            GrabState.running = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
         if (!GrabState.running) {
+            // nouvelle recherche : on oublie la machine précédente
+            Store.put(this, "last_ip", "")
+            Store.put(this, "last_instance", "")
             GrabState.running = true
             GrabState.attempts = 0
             GrabState.startedAt = System.currentTimeMillis()
             GrabState.status = "démarrage"
-            worker = Thread { work() }.also { it.start() }
+            val g = ++gen
+            worker = Thread { work(g) }.also { it.start() }
             handler.removeCallbacks(ticker)
             handler.postDelayed(ticker, 1000)
         }
@@ -80,10 +96,10 @@ class GrabService : Service() {
         } catch (e: Exception) {
             true
         }
-        if (present) nm.notify(NOTIF_ID, n) else startFg(n)
+        if (present) nm.notify(NOTIF_ID, n) else try { startFg(n) } catch (e: Exception) { /* on réessaie au prochain tick */ }
     }
 
-    private fun work() {
+    private fun work(g: Int) {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         val wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ocigrab:wl")
         wl.acquire()
@@ -96,7 +112,7 @@ class GrabService : Service() {
             }
             val key = KeyUtil.loadPrivate(cfg.privateKeyPem)
             AppLog.add("Démarrage : ${cfg.ocpus} cœurs / ${cfg.memoryGb} Go (${cfg.region}), essai toutes les ${cfg.intervalSec}s")
-            while (GrabState.running) {
+            while (GrabState.running && g == gen) {
                 GrabState.attempts++
                 val n = GrabState.attempts
                 var wait = cfg.intervalSec * 1000L
@@ -107,7 +123,7 @@ class GrabService : Service() {
                             AppLog.add("✅ MACHINE OBTENUE (essai $n) !")
                             val id = try { JSONObject(r.body).optString("id") } catch (e: Exception) { "" }
                             notifyFound("Machine Oracle obtenue !", "L'instance ARM a été créée. Récupération de l'IP…")
-                            if (id.isNotEmpty()) awaitIp(cfg, key, id)
+                            if (id.isNotEmpty()) awaitIp(cfg, key, id, g)
                             return
                         }
                         r.code == 429 -> {
@@ -137,20 +153,22 @@ class GrabService : Service() {
         } catch (e: Exception) {
             AppLog.add("Erreur : ${e.javaClass.simpleName} ${e.message}")
         } finally {
-            GrabState.running = false
-            handler.removeCallbacks(ticker)
             if (wl.isHeld) wl.release()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            if (g == gen) {
+                GrabState.running = false
+                handler.removeCallbacks(ticker)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
     }
 
-    private fun awaitIp(cfg: OciConfig, key: java.security.PrivateKey, id: String) {
+    private fun awaitIp(cfg: OciConfig, key: java.security.PrivateKey, id: String, g: Int) {
         Store.put(this, "last_instance", id)
         Store.put(this, "last_user", cfg.osUser)
         GrabState.status = "machine créée, attente de l'IP…"
         repeat(45) {
-            if (!GrabState.running) return
+            if (!GrabState.running || g != gen) return
             Thread.sleep(8000)
             try {
                 val st = OciClient.getInstance(cfg, key, id)

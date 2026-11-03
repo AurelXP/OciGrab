@@ -78,7 +78,7 @@ object OciClient {
         val msg = try { JSONObject(r.body).optString("message") } catch (e: Exception) { "" }
         val base = if (msg.isNotEmpty()) msg else r.body.take(200)
         return if (r.code == 401)
-            "$base → clé publique non ajoutée à ton profil, ou OCID / empreinte / région incorrects"
+            "$base → clé publique non ajoutée à ton profil, ou OCID / empreinte / région incorrects, ou heure du téléphone décalée de plus de 5 minutes (active l'heure automatique)"
         else base
     }
 
