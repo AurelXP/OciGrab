@@ -178,6 +178,7 @@ class MainActivity : Activity() {
     private var ready = false
     private var current = 0
     private var connecting = false
+    @Volatile private var connError = ""
     private var pendingContent = ""
     private var pendingName = ""
     private var preset = 0
@@ -743,7 +744,7 @@ class MainActivity : Activity() {
     // ---------- validation et navigation ----------
 
     private fun currentSig(): String =
-        "${txt("tenancy")}|${txt("user")}|${txt("region")}|${txt("compartment")}|${txt("key").hashCode()}|${txt("fingerprint")}"
+        "${txt("tenancy")}|${txt("user")}|${txt("region")}|${txt("compartment")}|${txt("key").hashCode()}"
 
     private fun batteryOk(): Boolean =
         (getSystemService(Context.POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(packageName)
@@ -933,14 +934,32 @@ class MainActivity : Activity() {
         }
         val sig = currentSig()
         connecting = true
+        connError = ""
         bg("Connexion à Oracle (${cfg.region})…") {
             try {
-                val key = KeyUtil.loadPrivate(cfg.privateKeyPem)
+                val key = try {
+                    KeyUtil.loadPrivate(cfg.privateKeyPem)
+                } catch (e: Exception) {
+                    connError = "Clé privée illisible : colle la clé complète, de « -----BEGIN … » à « -----END … ». (${e.javaClass.simpleName})"
+                    AppLog.add("⛔ $connError")
+                    return@bg
+                }
 
-                val r = OciClient.availabilityDomains(cfg, key)
+                // L'empreinte doit venir de la clé privée : on la recalcule et on compare à celle saisie.
+                val computed = try { KeyUtil.fingerprintOfPrivatePem(cfg.privateKeyPem) } catch (e: Exception) { "" }
+                var use = cfg
+                if (computed.isNotEmpty() && computed != cfg.fingerprint) {
+                    AppLog.add("Empreinte saisie ${cfg.fingerprint} ≠ empreinte de la clé privée $computed : on utilise celle de la clé.")
+                    use = cfg.copy(fingerprint = computed)
+                    Store.put(this, "fingerprint", computed)
+                    ui { edits["fingerprint"]?.setText(computed) }
+                }
+                val r = OciClient.availabilityDomains(use, key)
                 if (r.code !in 200..299) {
                     Store.put(this, "connected_sig", "")
-                    AppLog.add("⛔ Connexion refusée (${r.code}) : " + OciClient.explain(r))
+                    connError = "Refusé par Oracle (${r.code}) : " + OciClient.explain(r) +
+                        (if (r.code == 401) "\n\nEmpreinte de ta clé privée : $computed\nElle doit être identique à celle affichée dans la console Oracle (Clés API). Sinon, la clé privée collée n'est pas celle enregistrée : génère une nouvelle clé dans l'appli et ajoute sa clé publique dans la console." else "")
+                    AppLog.add("⛔ $connError")
                     return@bg
                 }
                 val ja = JSONArray(r.body)
@@ -953,7 +972,7 @@ class MainActivity : Activity() {
                 val seen = LinkedHashMap<String, Opt>()
                 var page: String? = null
                 for (p in 0 until 6) {
-                    val ri = OciClient.listImages(cfg, key, page)
+                    val ri = OciClient.listImages(use, key, page)
                     if (ri.code !in 200..299) {
                         AppLog.add("Images : erreur ${ri.code} : " + OciClient.explain(ri))
                         break
@@ -976,7 +995,7 @@ class MainActivity : Activity() {
                 )
 
                 // Sous-réseaux
-                val rs = OciClient.listSubnets(cfg, key)
+                val rs = OciClient.listSubnets(use, key)
                 val subnets = mutableListOf<Opt>()
                 if (rs.code in 200..299) {
                     val a = JSONArray(rs.body)
@@ -1006,6 +1025,9 @@ class MainActivity : Activity() {
                 if (subnets.isEmpty()) {
                     AppLog.add("Aucun sous-réseau : dans la console Oracle, lance l'assistant « Créer un VCN avec connectivité Internet », puis reconnecte-toi.")
                 }
+            } catch (e: Exception) {
+                connError = "Erreur réseau ou inattendue : ${e.javaClass.simpleName} ${e.message ?: ""}"
+                AppLog.add("⛔ $connError")
             } finally {
                 connecting = false
             }
@@ -1063,8 +1085,13 @@ class MainActivity : Activity() {
             else -> "● Non connecté"
         }
         connBadge.setTextColor(if (connecting) Ui.WARN else if (connected) Ui.OK else Ui.MUTED)
-        connInfo.text = if (connected)
-            "${adSp.opts.size} domaine(s) · ${allImages.size} système(s) · ${subnetSp.opts.size} sous-réseau(x)" else ""
+        val err = connError
+        connInfo.text = when {
+            connected -> "${adSp.opts.size} domaine(s) · ${allImages.size} système(s) · ${subnetSp.opts.size} sous-réseau(x)"
+            err.isNotEmpty() && !connecting -> err
+            else -> ""
+        }
+        connInfo.setTextColor(if (!connected && err.isNotEmpty()) Ui.ERR else Ui.MUTED)
 
         // étape SSH
         val k = txt("ssh")
