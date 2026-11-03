@@ -4,11 +4,13 @@ Appli Android qui demande en boucle une machine ARM **Always Free** (VM.Standard
 
 ## Ce que fait l'appli
 
-1. **Compte Oracle** : génère une clé API, affiche la clé publique à ajouter dans la console Oracle, puis « Se connecter » vérifie le compte.
-2. **Configuration** : listes déroulantes pour le domaine de disponibilité, le système d'exploitation et le sous-réseau, plus la taille (1 à 4 cœurs, 6 Go par cœur), le disque, le nom et le délai entre deux tentatives.
-3. **SSH** : génère ou importe une paire de clés, et permet de télécharger les clés pour se connecter à la machine.
-4. **Recherche** : service au premier plan avec une notification (vérifiée et remise toutes les secondes) et un bouton Arrêter.
-5. **Protection** : administrateur appareil (empêche la désinstallation directe) et dérogation batterie.
+L'appli est un assistant en 5 étapes avec une barre de progression. **On ne passe à l'étape suivante que si la précédente est valide** (champs corrects, connexion réussie, etc.) ; un message en bas indique ce qui reste à faire.
+
+1. **Compte** : génère une clé API, affiche la clé publique à ajouter dans la console Oracle, puis « Se connecter » vérifie le compte (obligatoire pour continuer).
+2. **Machine** : domaine de disponibilité, sous-réseau, **choix du système d'exploitation** (Ubuntu, Oracle Linux, etc., puis sa version), taille (1 à 4 cœurs, 6 Go par cœur), disque, nom et délai entre deux tentatives.
+3. **SSH** : génère ou importe une paire de clés ; il faut confirmer avoir sauvegardé la clé privée générée.
+4. **Protection** : dérogation batterie (obligatoire) et administrateur appareil (conseillé).
+5. **Recherche** : récapitulatif, démarrage/arrêt, IP, commande SSH et journal. Service au premier plan avec notification.
 
 ## Les fichiers
 
