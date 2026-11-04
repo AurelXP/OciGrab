@@ -2,6 +2,7 @@ package com.aurelien.ocigrab
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.admin.DevicePolicyManager
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -157,9 +158,10 @@ class MainActivity : Activity() {
 
     private val REQ_EXPORT = 42
     private val REQ_IMPORT = 43
-    private val LAST = 4
-    private val stepNames = listOf("Compte", "Machine", "SSH", "Protection", "Recherche")
+    private val LAST = 5
+    private val stepNames = listOf("Système", "Compte", "Machine", "SSH", "Protection", "Recherche")
     private val stepTitles = listOf(
+        "Quel système veux-tu ?",
         "Connecte ton compte Oracle",
         "Choisis ta machine",
         "Prépare l'accès SSH",
@@ -167,11 +169,16 @@ class MainActivity : Activity() {
         "Lance la recherche"
     )
     private val stepDescs = listOf(
+        "Le système d'exploitation qui sera installé sur ta machine.",
         "On vérifie que tes identifiants marchent avant d'aller plus loin.",
-        "Emplacement, système d'exploitation, puissance et stockage.",
+        "Emplacement, version du système, puissance et stockage.",
         "La clé SSH sert à te connecter à la machine une fois créée.",
         "Pour que la recherche continue écran éteint.",
         "L'appli redemande une machine à Oracle jusqu'à en obtenir une."
+    )
+    private val osChoices = listOf(
+        Triple("Canonical Ubuntu", "Ubuntu", "Le plus courant et le mieux documenté. Connexion SSH avec l'utilisateur « ubuntu »."),
+        Triple("Oracle Linux", "Oracle Linux", "Conçu par Oracle, compatible RHEL / CentOS. Connexion SSH avec l'utilisateur « opc ».")
     )
 
     private val handler = Handler(Looper.getMainLooper())
@@ -217,6 +224,16 @@ class MainActivity : Activity() {
 
     private var allImages: List<Opt> = emptyList()
     private var osFamily = ""
+    private lateinit var osBox: LinearLayout
+
+    // gestion des machines
+    private lateinit var managerPage: LinearLayout
+    private lateinit var managerList: LinearLayout
+    private lateinit var managerStatus: TextView
+    private var managerOpen = false
+    @Volatile private var loadingMachines = false
+    private var machines: List<Machine> = emptyList()
+    private var tick = 0
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun ui(block: () -> Unit) = runOnUiThread { block() }
@@ -473,11 +490,18 @@ class MainActivity : Activity() {
             setBackgroundColor(Ui.BG)
         }
 
+        osFamily = Store.get(this, "os_family")
+
         page.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(18), dp(20), dp(6))
-            addView(tv("OCI Grab", 26f, Ui.TEXT, true))
-            addView(tv("Machine ARM Always Free sur Oracle Cloud", 13f, Ui.MUTED))
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(20), dp(18), dp(16), dp(6))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(tv("Oracle Cloud Grabber and Manager", 19f, Ui.TEXT, true))
+                addView(tv("Machine ARM Always Free sur Oracle Cloud", 12.5f, Ui.MUTED))
+            }, LinearLayout.LayoutParams(0, WRAP, 1f))
+            addView(pill("🖥 Machines") { openManager() })
         })
         page.addView(buildStepper())
 
@@ -486,7 +510,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(8), dp(16), dp(16))
         }
-        stepViews = listOf(buildAccount(), buildMachine(), buildSsh(), buildProtection(), buildSearch())
+        stepViews = listOf(buildOsStep(), buildAccount(), buildMachine(), buildSsh(), buildProtection(), buildSearch())
         stepViews.forEach { holder.addView(it) }
         scroll.addView(holder)
         page.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
@@ -506,7 +530,11 @@ class MainActivity : Activity() {
         (btnNext.layoutParams as LinearLayout.LayoutParams).weight = 2f
         page.addView(bottom, LinearLayout.LayoutParams(MATCH, WRAP))
 
-        setContentView(page)
+        managerPage = buildManager()
+        setContentView(FrameLayout(this).apply {
+            addView(page, FrameLayout.LayoutParams(MATCH, MATCH))
+            addView(managerPage, FrameLayout.LayoutParams(MATCH, MATCH))
+        })
 
         if (Build.VERSION.SDK_INT >= 33) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
@@ -542,7 +570,7 @@ class MainActivity : Activity() {
             }
             top.addView(c, FrameLayout.LayoutParams(dp(32), dp(32), Gravity.CENTER))
             cell.addView(top, LinearLayout.LayoutParams(MATCH, dp(32)))
-            val lab = tv(stepNames[i], 10.5f, Ui.MUTED).apply {
+            val lab = tv(stepNames[i], 10f, Ui.MUTED).apply {
                 gravity = Gravity.CENTER
                 maxLines = 1
                 setPadding(0, dp(5), 0, 0)
@@ -560,7 +588,7 @@ class MainActivity : Activity() {
     // ----- étape 1 : compte -----
 
     private fun buildAccount(): LinearLayout {
-        val s = stepContainer(0)
+        val s = stepContainer(1)
 
         val c1 = card(
             s, "1 · Génère ta clé API",
@@ -596,7 +624,7 @@ class MainActivity : Activity() {
     // ----- étape 2 : machine -----
 
     private fun buildMachine(): LinearLayout {
-        val s = stepContainer(1)
+        val s = stepContainer(2)
 
         val c1 = card(s, "Emplacement")
         caption(c1, "Domaine de disponibilité")
@@ -670,9 +698,11 @@ class MainActivity : Activity() {
         val saved = Store.get(this, "os_family")
         osFamily = when {
             saved in fams -> saved
-            else -> fams.firstOrNull { it.contains("Ubuntu", ignoreCase = true) } ?: fams.firstOrNull() ?: ""
+            else -> fams.firstOrNull { it.contains("Ubuntu", ignoreCase = true) } ?: fams.firstOrNull() ?: osFamily
         }
+        if (fams.isNotEmpty()) Store.put(this, "os_family", osFamily)
         renderOs()
+        renderOsTiles()
     }
 
     private fun renderOs() {
@@ -691,11 +721,7 @@ class MainActivity : Activity() {
                 else
                     Ui.rounded(this@MainActivity, Ui.FIELD, 20, Ui.BORDER)
                 setPadding(dp(16), dp(10), dp(16), dp(10))
-                setOnClickListener {
-                    osFamily = f
-                    Store.put(this@MainActivity, "os_family", f)
-                    renderOs()
-                }
+                setOnClickListener { chooseOs(f) }
             }
             osChips.addView(chip, LinearLayout.LayoutParams(WRAP, WRAP).apply { rightMargin = dp(8) })
         }
@@ -709,7 +735,7 @@ class MainActivity : Activity() {
     // ----- étape 3 : SSH -----
 
     private fun buildSsh(): LinearLayout {
-        val s = stepContainer(2)
+        val s = stepContainer(3)
         val c1 = card(
             s, "Clé SSH",
             "Génère une paire de clés (ou colle ta clé publique). Sans la clé privée, impossible de te connecter."
@@ -739,7 +765,7 @@ class MainActivity : Activity() {
     // ----- étape 4 : protection -----
 
     private fun buildProtection(): LinearLayout {
-        val s = stepContainer(3)
+        val s = stepContainer(4)
         val c1 = card(s, "Arrière-plan (obligatoire)", "Sans cette autorisation, Android peut endormir l'appli et stopper la recherche.")
         batteryView = tv("", 14f, Ui.MUTED, true)
         c1.addView(batteryView)
@@ -770,7 +796,7 @@ class MainActivity : Activity() {
     // ----- étape 5 : recherche -----
 
     private fun buildSearch(): LinearLayout {
-        val s = stepContainer(4)
+        val s = stepContainer(5)
 
         val c0 = card(s, "Récapitulatif")
         summaryView = tv("", 13.5f, Ui.TEXT)
@@ -793,6 +819,7 @@ class MainActivity : Activity() {
         val r2 = row(c2)
         btn(r2, "Rafraîchir l'IP") { refreshIp() }
         btn(r2, "Copier SSH") { copy(sshCommand()) }
+        btn(c2, "🖥 Gérer mes machines", Kind.PRIMARY) { openManager() }
 
         val c3 = card(s, "Journal")
         logView = tv("", 11f, Ui.MUTED).apply {
@@ -801,6 +828,378 @@ class MainActivity : Activity() {
         }
         c3.addView(logView)
         return s
+    }
+
+    // ----- étape 1 : système d'exploitation -----
+
+    private fun buildOsStep(): LinearLayout {
+        val s = stepContainer(0)
+        val c = card(
+            s, "Système d'exploitation",
+            "Tu pourras choisir la version à l'étape Machine. D'autres systèmes peuvent apparaître après la connexion."
+        )
+        osBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        c.addView(osBox)
+        renderOsTiles()
+        return s
+    }
+
+    private fun renderOsTiles() {
+        if (!this::osBox.isInitialized) return
+        osBox.removeAllViews()
+        val list = osChoices.toMutableList()
+        if (osFamily.isNotEmpty() && list.none { it.first == osFamily }) {
+            list.add(Triple(osFamily, osName(osFamily), "Choisi à l'étape Machine."))
+        }
+        for ((fam, title, desc) in list) {
+            val sel = fam == osFamily
+            val t = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(16), dp(14), dp(16), dp(14))
+                background = if (sel)
+                    Ui.rounded(this@MainActivity, Color.parseColor("#2A2434"), 14, Ui.ACCENT, 2)
+                else
+                    Ui.rounded(this@MainActivity, Ui.FIELD, 14, Ui.BORDER)
+                setOnClickListener { chooseOs(fam) }
+            }
+            t.addView(tv((if (sel) "● " else "○ ") + title, 16f, if (sel) Ui.ACCENT else Ui.TEXT, true))
+            t.addView(tv(desc, 12.5f, Ui.MUTED).apply { setPadding(0, dp(4), 0, 0) })
+            osBox.addView(t, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
+        }
+    }
+
+    private fun chooseOs(fam: String) {
+        osFamily = fam
+        Store.put(this, "os_family", fam)
+        renderOsTiles()
+        if (this::osChips.isInitialized) renderOs()
+        if (ready) updateNav()
+    }
+
+    // ---------- gestion des machines ----------
+
+    private fun pill(label: String, onClick: () -> Unit): TextView =
+        TextView(this).apply {
+            text = label
+            textSize = 13f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Ui.TEXT)
+            gravity = Gravity.CENTER
+            background = Ui.rounded(this@MainActivity, Ui.FIELD, 20, Ui.BORDER)
+            setPadding(dp(14), dp(9), dp(14), dp(9))
+            setOnClickListener { onClick() }
+        }
+
+    private fun buildManager(): LinearLayout {
+        val p = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Ui.BG)
+            visibility = View.GONE
+            isClickable = true
+        }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(18), dp(14), dp(8))
+        }
+        head.addView(pill("‹ Retour") { closeManager() })
+        head.addView(
+            tv("Mes machines", 20f, Ui.TEXT, true).apply { gravity = Gravity.CENTER },
+            LinearLayout.LayoutParams(0, WRAP, 1f)
+        )
+        head.addView(pill("↻ Actualiser") { loadMachines() })
+        p.addView(head)
+        managerStatus = tv("", 12.5f, Ui.MUTED).apply { setPadding(dp(20), 0, dp(20), dp(8)) }
+        p.addView(managerStatus)
+        val sc = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
+        managerList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(4), dp(16), dp(24))
+        }
+        sc.addView(managerList)
+        p.addView(sc, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        return p
+    }
+
+    private fun openManager() {
+        if (Store.get(this, "connected_sig") != currentSig() || txt("key").isEmpty()) {
+            Toast.makeText(this, "Connecte-toi d'abord à Oracle (étape Compte).", Toast.LENGTH_LONG).show()
+            return
+        }
+        save()
+        managerOpen = true
+        managerPage.visibility = View.VISIBLE
+        loadMachines()
+    }
+
+    private fun closeManager() {
+        managerOpen = false
+        managerPage.visibility = View.GONE
+    }
+
+    private fun loadMachines() {
+        if (loadingMachines) return
+        save()
+        val cfg = Store.config(this)
+        loadingMachines = true
+        managerStatus.value = "Chargement des machines…"
+        Thread {
+            try {
+                val key = KeyUtil.loadPrivate(cfg.privateKeyPem)
+                val out = ArrayList<Machine>()
+                var page: String? = null
+                for (n in 0 until 5) {
+                    val r = OciClient.listInstances(cfg, key, page)
+                    if (r.code !in 200..299) {
+                        val msg = "Erreur ${r.code} : " + OciClient.explain(r)
+                        ui { managerStatus.value = msg }
+                        return@Thread
+                    }
+                    val a = JSONArray(r.body)
+                    for (i in 0 until a.length()) {
+                        val o = a.getJSONObject(i)
+                        val st = o.optString("lifecycleState")
+                        if (st == "TERMINATED") continue
+                        val sc = o.optJSONObject("shapeConfig")
+                        out.add(
+                            Machine(
+                                o.optString("id"), o.optString("displayName"), st, o.optString("shape"),
+                                sc?.optDouble("ocpus", 0.0) ?: 0.0, sc?.optDouble("memoryInGBs", 0.0) ?: 0.0,
+                                o.optString("timeCreated").take(10)
+                            )
+                        )
+                    }
+                    page = r.nextPage ?: break
+                }
+                for (m in out) {
+                    if (m.state == "RUNNING") m.ip = OciClient.publicIp(cfg, key, m.id) ?: ""
+                }
+                ui {
+                    machines = out
+                    renderMachines()
+                    val busy = out.any { it.state != "RUNNING" && it.state != "STOPPED" }
+                    managerStatus.value = "${out.size} machine(s)" + (if (busy) " · mise à jour automatique en cours" else "") +
+                        (if (cfg.compartment == cfg.tenancy) " · compartiment racine" else "")
+                }
+            } catch (e: Exception) {
+                ui { managerStatus.value = "Erreur : ${e.message ?: e.javaClass.simpleName}" }
+            } finally {
+                loadingMachines = false
+            }
+        }.start()
+    }
+
+    private fun stateColor(s: String) = when (s) {
+        "RUNNING" -> Ui.OK
+        "STOPPED" -> Ui.MUTED
+        else -> Ui.WARN
+    }
+
+    private fun stateLabel(s: String) = when (s) {
+        "RUNNING" -> "En marche"
+        "STOPPED" -> "Arrêtée"
+        "STARTING" -> "Démarrage…"
+        "STOPPING" -> "Arrêt…"
+        "PROVISIONING" -> "Création…"
+        "TERMINATING" -> "Suppression…"
+        "MOVING" -> "Déplacement…"
+        else -> s
+    }
+
+    private fun renderMachines() {
+        managerList.removeAllViews()
+        if (machines.isEmpty()) {
+            managerList.addView(
+                tv("Aucune machine dans ce compartiment.", 14f, Ui.MUTED).apply { setPadding(dp(4), dp(12), dp(4), 0) }
+            )
+            return
+        }
+        for (m in machines) machineCard(m)
+    }
+
+    private fun machineCard(m: Machine) {
+        val c = card(managerList)
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        top.addView(
+            tv(m.name, 16f, Ui.TEXT, true).apply {
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            },
+            LinearLayout.LayoutParams(0, WRAP, 1f)
+        )
+        top.addView(tv("● " + stateLabel(m.state), 12.5f, stateColor(m.state), true))
+        c.addView(top)
+        val ram = if (m.memoryGb % 1.0 == 0.0) m.memoryGb.toInt().toString() else m.memoryGb.toString()
+        c.addView(
+            tv("${m.shape} · ${m.ocpus.toInt()} cœur(s) · $ram Go · créée le ${m.created}", 12.5f, Ui.MUTED)
+                .apply { setPadding(0, dp(4), 0, dp(4)) }
+        )
+        if (m.ip.isNotEmpty()) {
+            c.addView(mono("IP : ${m.ip}", 12f), LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(4) })
+        }
+
+        val transitional = m.state != "RUNNING" && m.state != "STOPPED"
+        if (transitional) {
+            c.addView(
+                tv("Opération en cours : la liste se met à jour toute seule.", 12f, Ui.WARN)
+                    .apply { setPadding(0, dp(8), 0, 0) }
+            )
+        } else {
+            val r1 = row(c)
+            if (m.state == "STOPPED") {
+                btn(r1, "▶ Démarrer", Kind.PRIMARY) { machineAction(m, "START", "Démarrage") }
+            } else {
+                btn(r1, "■ Arrêter") {
+                    confirmThen("Arrêter « ${m.name} » ?") { machineAction(m, "SOFTSTOP", "Arrêt") }
+                }
+                btn(r1, "↻ Redémarrer") {
+                    confirmThen("Redémarrer « ${m.name} » ?") { machineAction(m, "SOFTRESET", "Redémarrage") }
+                }
+            }
+        }
+        val r2 = row(c)
+        btn(r2, "✏ Renommer") { renameDialog(m) }
+        if (m.shape.contains("Flex")) btn(r2, "⚙ Taille") { resizeDialog(m) }
+        btn(r2, "🗑 Supprimer", Kind.DANGER) { deleteDialog(m) }
+        if (m.ip.isNotEmpty()) {
+            val r3 = row(c)
+            btn(r3, "Copier l'IP") { copy(m.ip) }
+            btn(r3, "Copier SSH") {
+                copy("ssh -i oci_ssh_key.pem ${Store.get(this, "last_user", "ubuntu")}@${m.ip}")
+            }
+        }
+    }
+
+    private fun machineAction(m: Machine, action: String, label: String) {
+        runManager("$label de « ${m.name} »") { cfg, key -> OciClient.instanceAction(cfg, key, m.id, action) }
+    }
+
+    private fun runManager(label: String, call: (OciConfig, java.security.PrivateKey) -> OciResult) {
+        val cfg = Store.config(this)
+        managerStatus.value = "$label…"
+        AppLog.add("Gestion : $label…")
+        Thread {
+            try {
+                val key = KeyUtil.loadPrivate(cfg.privateKeyPem)
+                val r = call(cfg, key)
+                if (r.code in 200..299) {
+                    AppLog.add("Gestion : $label : demandé à Oracle.")
+                    ui { managerStatus.value = "$label : demandé à Oracle." }
+                } else {
+                    val msg = "$label refusé (${r.code}) : " + OciClient.explain(r)
+                    AppLog.add("⛔ $msg")
+                    ui {
+                        managerStatus.value = msg
+                        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                    }
+                }
+            } catch (e: Exception) {
+                val msg = "$label : erreur ${e.message ?: e.javaClass.simpleName}"
+                AppLog.add("⛔ $msg")
+                ui { managerStatus.value = msg }
+            }
+            handler.postDelayed({ loadMachines() }, 2500)
+        }.start()
+    }
+
+    private val dialogTheme get() = android.R.style.Theme_DeviceDefault_Dialog_Alert
+
+    private fun confirmThen(msg: String, ok: () -> Unit) {
+        AlertDialog.Builder(this, dialogTheme)
+            .setMessage(msg)
+            .setPositiveButton("Confirmer") { _, _ -> ok() }
+            .setNegativeButton("Annuler", null)
+            .show()
+    }
+
+    private fun dialogField(hint: String, value: String, numeric: Boolean): EditText =
+        EditText(this).apply {
+            this.hint = hint
+            setText(value)
+            setHintTextColor(Ui.HINT)
+            setTextColor(Ui.TEXT)
+            inputType = if (numeric) InputType.TYPE_CLASS_NUMBER
+            else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSingleLine(true)
+        }
+
+    private fun dialogBox(vararg views: View): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+            for (v in views) addView(v)
+        }
+
+    private fun renameDialog(m: Machine) {
+        val et = dialogField("Nouveau nom", m.name, false)
+        AlertDialog.Builder(this, dialogTheme)
+            .setTitle("Renommer la machine")
+            .setView(dialogBox(et))
+            .setPositiveButton("Enregistrer") { _, _ ->
+                val n = et.text.toString().trim()
+                if (n.isNotEmpty() && n != m.name) {
+                    runManager("Renommage de « ${m.name} »") { cfg, key ->
+                        OciClient.updateInstance(cfg, key, m.id, n, null, null)
+                    }
+                }
+            }
+            .setNegativeButton("Annuler", null)
+            .show()
+    }
+
+    private fun resizeDialog(m: Machine) {
+        val cores = dialogField("Cœurs (1 à 4)", m.ocpus.toInt().toString(), true)
+        val ram = dialogField("Mémoire en Go (1 à 24)", m.memoryGb.toInt().toString(), true)
+        val note = tv(
+            "La machine redémarre pour appliquer le changement. Quota Always Free : 4 cœurs et 24 Go au total.",
+            12f, Ui.MUTED
+        ).apply { setPadding(0, dp(10), 0, 0) }
+        AlertDialog.Builder(this, dialogTheme)
+            .setTitle("Changer la taille")
+            .setView(dialogBox(cores, ram, note))
+            .setPositiveButton("Appliquer") { _, _ ->
+                val c = cores.text.toString().toIntOrNull()
+                val g = ram.text.toString().toIntOrNull()
+                if (c == null || c !in 1..4 || g == null || g !in 1..24) {
+                    Toast.makeText(this, "Cœurs : 1 à 4, mémoire : 1 à 24 Go.", Toast.LENGTH_LONG).show()
+                } else {
+                    runManager("Changement de taille de « ${m.name} »") { cfg, key ->
+                        OciClient.updateInstance(cfg, key, m.id, null, c, g)
+                    }
+                }
+            }
+            .setNegativeButton("Annuler", null)
+            .show()
+    }
+
+    private fun deleteDialog(m: Machine) {
+        val et = dialogField("Tape le nom exact pour confirmer", "", false)
+        val d = AlertDialog.Builder(this, dialogTheme)
+            .setTitle("Supprimer définitivement ?")
+            .setMessage("« ${m.name} » et son disque de démarrage seront détruits. Action irréversible.")
+            .setView(dialogBox(et))
+            .setPositiveButton("Supprimer") { _, _ ->
+                if (m.id == Store.get(this, "last_instance")) {
+                    Store.put(this, "last_instance", "")
+                    Store.put(this, "last_ip", "")
+                }
+                runManager("Suppression de « ${m.name} »") { cfg, key -> OciClient.terminateInstance(cfg, key, m.id) }
+            }
+            .setNegativeButton("Annuler", null)
+            .create()
+        d.show()
+        val ok = d.getButton(AlertDialog.BUTTON_POSITIVE)
+        ok.isEnabled = false
+        et.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                ok.isEnabled = et.text.toString().trim() == m.name
+            }
+        })
     }
 
     // ---------- validation et navigation ----------
@@ -815,6 +1214,9 @@ class MainActivity : Activity() {
         val m = mutableListOf<String>()
         when (i) {
             0 -> {
+                if (osFamily.isEmpty()) m.add("choisis un système d'exploitation")
+            }
+            1 -> {
                 val t = txt("tenancy")
                 val u = txt("user")
                 val r = txt("region")
@@ -831,7 +1233,7 @@ class MainActivity : Activity() {
                 if (m.isEmpty() && Store.get(this, "connected_sig") != currentSig())
                     m.add("clique sur « Se connecter à Oracle » et attends le ✅")
             }
-            1 -> {
+            2 -> {
                 if (adSp.selected() == null) m.add("Domaine de disponibilité")
                 if (subnetSp.selected() == null) m.add("Sous-réseau")
                 if (imageSp.selected() == null) m.add("Système d'exploitation")
@@ -842,7 +1244,7 @@ class MainActivity : Activity() {
                 val iv = txt("interval").toIntOrNull()
                 if (iv == null || iv < 10) m.add("Délai : 10 secondes minimum")
             }
-            2 -> {
+            3 -> {
                 val k = txt("ssh")
                 if (k.isEmpty()) m.add("Clé publique SSH (génère-la ou colle la tienne)")
                 else if (!k.startsWith("ssh-") && !k.startsWith("ecdsa-"))
@@ -850,7 +1252,7 @@ class MainActivity : Activity() {
                 else if (k == Store.get(this, "ssh_gen_pub") && Store.get(this, "ssh_ack") != k)
                     m.add("confirme avoir sauvegardé la clé privée SSH")
             }
-            3 -> {
+            4 -> {
                 if (!batteryOk()) m.add("autoriser l'appli en arrière-plan (batterie)")
             }
         }
@@ -1138,6 +1540,10 @@ class MainActivity : Activity() {
 
     private fun refreshUi() {
         val running = GrabState.running
+        tick++
+        if (managerOpen && tick % 8 == 0 && !loadingMachines &&
+            machines.any { it.state != "RUNNING" && it.state != "STOPPED" }
+        ) loadMachines()
 
         // étape Compte
         val connected = Store.get(this, "connected_sig") == currentSig() && txt("key").isNotEmpty()
@@ -1198,6 +1604,11 @@ class MainActivity : Activity() {
             }
         }
         updateNav()
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        if (managerOpen) closeManager() else super.onBackPressed()
     }
 
     override fun onResume() {

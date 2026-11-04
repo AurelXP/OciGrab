@@ -10,7 +10,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="OCI Grab"
+        android:label="Oracle Cloud Grabber and Manager"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <activity

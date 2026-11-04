@@ -222,7 +222,7 @@ class GrabService : Service() {
         )
         val b = Notification.Builder(this, "grab")
             .setSmallIcon(android.R.drawable.stat_sys_download)
-            .setContentTitle("OCI Grab")
+            .setContentTitle("Oracle Cloud Grabber and Manager")
             .setContentText(text.substringBefore("\n"))
             .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(open)

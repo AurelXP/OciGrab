@@ -16,6 +16,14 @@ import java.util.TimeZone
 
 data class OciResult(val code: Int, val body: String, val nextPage: String? = null)
 
+/** Une machine (instance) Oracle telle qu'affichée dans l'écran de gestion. */
+class Machine(
+    val id: String, val name: String, val state: String, val shape: String,
+    val ocpus: Double, val memoryGb: Double, val created: String
+) {
+    var ip: String = ""
+}
+
 object OciClient {
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
@@ -113,6 +121,30 @@ object OciClient {
         }.toString()
         return call(cfg, key, "POST", "iaas", "/20160918/instances", body)
     }
+
+    fun listInstances(cfg: OciConfig, key: PrivateKey, page: String?): OciResult {
+        var q = "/20160918/instances?compartmentId=${enc(cfg.compartment)}&limit=100&sortBy=TIMECREATED&sortOrder=DESC"
+        if (page != null) q += "&page=${enc(page)}"
+        return call(cfg, key, "GET", "iaas", q)
+    }
+
+    /** action : START, SOFTSTOP, SOFTRESET (arrêt / redémarrage propres), STOP, RESET (forcés). */
+    fun instanceAction(cfg: OciConfig, key: PrivateKey, id: String, action: String): OciResult =
+        call(cfg, key, "POST", "iaas", "/20160918/instances/${enc(id)}?action=$action", "")
+
+    /** Renomme et/ou change la taille (Flex). Un changement de taille redémarre la machine. */
+    fun updateInstance(cfg: OciConfig, key: PrivateKey, id: String, name: String?, ocpus: Int?, memoryGb: Int?): OciResult {
+        val body = JSONObject()
+        if (name != null) body.put("displayName", name)
+        if (ocpus != null && memoryGb != null) {
+            body.put("shapeConfig", JSONObject().put("ocpus", ocpus).put("memoryInGBs", memoryGb))
+        }
+        return call(cfg, key, "PUT", "iaas", "/20160918/instances/${enc(id)}", body.toString())
+    }
+
+    /** Supprime la machine ET son disque de démarrage. */
+    fun terminateInstance(cfg: OciConfig, key: PrivateKey, id: String): OciResult =
+        call(cfg, key, "DELETE", "iaas", "/20160918/instances/${enc(id)}?preserveBootVolume=false")
 
     fun getInstance(cfg: OciConfig, key: PrivateKey, id: String): OciResult =
         call(cfg, key, "GET", "iaas", "/20160918/instances/${enc(id)}")
