@@ -79,12 +79,28 @@ object KeyUtil {
     }
 
     fun loadPrivate(pem: String): PrivateKey {
-        require(!pem.contains("ENCRYPTED")) { "clé chiffrée par mot de passe : génère-en une sans passphrase" }
-        require(!pem.contains("BEGIN OPENSSH PRIVATE KEY")) { "format OpenSSH non géré : utilise une clé PEM (BEGIN RSA PRIVATE KEY)" }
-        val isPkcs1 = pem.contains("BEGIN RSA PRIVATE KEY")
-        val b64 = pem.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("-----") }
-            .joinToString("").replace("\\s".toRegex(), "")
-        var bytes = Base64.decode(b64, Base64.DEFAULT)
+        require(!pem.contains("ENCRYPTED")) { "clé protégée par un mot de passe : génère-en une sans mot de passe" }
+        require(!pem.contains("BEGIN OPENSSH PRIVATE KEY")) {
+            "format OpenSSH non géré : utilise une clé PEM (BEGIN PRIVATE KEY ou BEGIN RSA PRIVATE KEY)"
+        }
+        require(pem.contains("PRIVATE KEY")) {
+            when {
+                pem.contains("PUBLIC KEY") -> "c'est la clé PUBLIQUE ; il faut la clé PRIVÉE (celle qui contient « PRIVATE KEY »)"
+                pem.contains("CERTIFICATE") -> "c'est un certificat, pas une clé privée"
+                else -> "aucune clé privée trouvée (elle commence par -----BEGIN PRIVATE KEY-----)"
+            }
+        }
+        // On ne garde que ce qui est entre BEGIN et END : Oracle ajoute parfois une ligne « OCI_API_KEY » après.
+        val m = Regex("-----BEGIN (RSA )?PRIVATE KEY-----(.*?)-----END (RSA )?PRIVATE KEY-----", RegexOption.DOT_MATCHES_ALL)
+            .find(pem)
+        require(m != null) { "clé incomplète : il manque la ligne -----END PRIVATE KEY-----" }
+        val isPkcs1 = m.groupValues[1].isNotEmpty()
+        val b64 = m.groupValues[2].replace("\\s".toRegex(), "")
+        var bytes = try {
+            Base64.decode(b64, Base64.DEFAULT)
+        } catch (e: IllegalArgumentException) {
+            throw IllegalArgumentException("clé abîmée (caractères invalides), recopie-la en entier")
+        }
         if (isPkcs1) bytes = wrapPkcs1(bytes)
         return KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(bytes))
     }

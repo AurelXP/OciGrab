@@ -158,6 +158,7 @@ class MainActivity : Activity() {
 
     private val REQ_EXPORT = 42
     private val REQ_IMPORT = 43
+    private val REQ_IMPORT_SSH = 44
     private val LAST = 5
     private val stepNames = listOf("Système", "Compte", "Machine", "SSH", "Protection", "Recherche")
     private val stepTitles = listOf(
@@ -402,6 +403,51 @@ class MainActivity : Activity() {
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
     }
 
+    /** Valide une clé privée (fichier ou presse-papiers) et remplit clé, empreinte et clé publique. */
+    private fun applyPrivateKey(raw: String): Boolean {
+        val text = raw.trim()
+        return try {
+            val pub = KeyUtil.publicPemOfPrivatePem(text)
+            val fp = KeyUtil.fingerprintOfPrivatePem(text)
+            edits["key"]?.setText(text)
+            edits["fingerprint"]?.setText(fp)
+            apiPubView.text = pub
+            Store.put(this, "api_pub", pub)
+            AppLog.add("Clé privée reçue. Empreinte : $fp")
+            Toast.makeText(this, "Clé privée reçue ✓ Empreinte : $fp", Toast.LENGTH_LONG).show()
+            true
+        } catch (e: Exception) {
+            val msg = "Clé refusée : ${e.message ?: e.javaClass.simpleName}"
+            AppLog.add(msg)
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            false
+        }
+    }
+
+    private fun pastePrivateKey() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val t = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString() ?: ""
+        if (t.isBlank()) {
+            Toast.makeText(this, "Le presse-papiers est vide : copie d'abord la clé privée.", Toast.LENGTH_LONG).show()
+            return
+        }
+        applyPrivateKey(t)
+    }
+
+    private fun importSshPub() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+        startActivityForResult(i, REQ_IMPORT_SSH)
+    }
+
+    private fun readSmallText(uri: Uri): String =
+        contentResolver.openInputStream(uri)?.bufferedReader()?.use { r ->
+            val buf = CharArray(20000)
+            val n = r.read(buf)
+            String(buf, 0, maxOf(n, 0))
+        } ?: ""
+
     private fun importPem() {
         val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
             .addCategory(Intent.CATEGORY_OPENABLE)
@@ -437,27 +483,30 @@ class MainActivity : Activity() {
         if (requestCode == REQ_IMPORT && resultCode == RESULT_OK) {
             val uri = data?.data ?: return
             try {
-                val text = contentResolver.openInputStream(uri)?.bufferedReader()?.use { r ->
-                    val buf = CharArray(20000)
-                    val n = r.read(buf)
-                    String(buf, 0, maxOf(n, 0))
-                } ?: ""
-                if (!text.contains("PRIVATE KEY")) {
-                    Toast.makeText(this, "Ce fichier ne contient pas de clé privée", Toast.LENGTH_LONG).show()
-                    return
-                }
-                val pub = KeyUtil.publicPemOfPrivatePem(text)
-                val fp = KeyUtil.fingerprintOfPrivatePem(text)
-                edits["key"]?.setText(text.trim())
-                edits["fingerprint"]?.setText(fp)
-                apiPubView.text = pub
-                Store.put(this, "api_pub", pub)
-                AppLog.add("Clé privée importée. Empreinte : $fp")
-                Toast.makeText(this, "Clé importée. Empreinte : $fp", Toast.LENGTH_LONG).show()
+                val text = readSmallText(uri)
+                if (text.isBlank()) Toast.makeText(this, "Fichier vide ou illisible", Toast.LENGTH_LONG).show()
+                else applyPrivateKey(text)
             } catch (e: Exception) {
-                val msg = "Clé illisible : ${e.message ?: e.javaClass.simpleName}"
+                val msg = "Fichier illisible : ${e.message ?: e.javaClass.simpleName}"
                 AppLog.add(msg)
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        if (requestCode == REQ_IMPORT_SSH && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            try {
+                val line = readSmallText(uri).lines().map { it.trim() }
+                    .firstOrNull { it.startsWith("ssh-") || it.startsWith("ecdsa-") }
+                if (line == null) {
+                    Toast.makeText(this, "Pas de clé publique SSH dans ce fichier (elle commence par ssh-rsa ou ssh-ed25519).", Toast.LENGTH_LONG).show()
+                } else {
+                    edits["ssh"]?.setText(line)
+                    AppLog.add("Clé publique SSH importée.")
+                    Toast.makeText(this, "Clé publique SSH importée ✓", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, "Fichier illisible : ${e.message ?: e.javaClass.simpleName}", Toast.LENGTH_LONG).show()
             }
             return
         }
@@ -590,26 +639,50 @@ class MainActivity : Activity() {
     private fun buildAccount(): LinearLayout {
         val s = stepContainer(1)
 
+        val c0 = card(s, "Comment ça marche ?")
+        c0.addView(
+            tv(
+                "Oracle utilise deux clés qui vont ensemble :\n" +
+                    "• la clé PUBLIQUE : tu la donnes à Oracle (sans risque).\n" +
+                    "• la clé PRIVÉE : elle reste dans l'appli, ne la partage jamais.\n\n" +
+                    "Le plus simple : laisse l'appli créer les deux (cadre 1). Si tu donnes ta propre clé publique à Oracle, " +
+                    "Oracle ne fabrique pas de clé privée : c'est normal, c'est à toi de la fournir (cadre « J'ai déjà une clé »).",
+                13f, Ui.MUTED
+            )
+        )
+
         val c1 = card(
-            s, "1 · Génère ta clé API",
-            "Ajoute ensuite la clé publique dans la console Oracle : Profil › Clés API › Ajouter une clé API › Coller une clé publique."
+            s, "1 · Crée ta clé dans l'appli (recommandé)",
+            "Puis dans la console Oracle : ton profil › Clés API › Ajouter une clé API › « Coller une clé publique » › colle › Ajouter. Oracle affiche alors un aperçu de configuration : copie-le."
         )
         btn(c1, "Générer une clé API", Kind.PRIMARY) { genApiKey() }
         apiPubView = mono(Store.get(this, "api_pub"), 10f)
         c1.addView(apiPubView, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(10) })
         val r1 = row(c1)
-        btn(r1, "Copier") { copy(apiPubView.text.toString()) }
-        btn(r1, "Télécharger") { export("oci_api_public.pem", apiPubView.text.toString()) }
+        btn(r1, "Copier la clé publique") { copy(apiPubView.text.toString()) }
+        btn(r1, "Enregistrer") { export("oci_api_public.pem", apiPubView.text.toString()) }
 
-        val c2 = card(s, "2 · Colle tes identifiants", "Tu les trouves dans la console Oracle (profil et locataire).")
+        val c1b = card(
+            s, "J'ai déjà une clé",
+            "Importe la clé PRIVÉE (celle que tu as téléchargée, ou la tienne). La clé publique correspondante doit déjà être ajoutée chez Oracle."
+        )
+        btn(c1b, "📋 Coller la clé privée (presse-papiers)") { pastePrivateKey() }
+        btn(c1b, "📂 Importer un fichier de clé privée") { importPem() }
+        c1b.addView(
+            tv(
+                "Ne touche pas au fichier .pem dans tes téléchargements : Android propose de l'installer comme certificat, ce n'est pas ce qu'on veut. Utilise ces boutons à la place.",
+                12f, Ui.MUTED
+            ).apply { setPadding(0, dp(8), 0, 0) }
+        )
+
+        val c2 = card(s, "2 · Colle tes identifiants", "Colle l'aperçu de configuration d'Oracle : l'appli en extrait l'OCID, l'empreinte et la région.")
         btn(c2, "📋 Coller la config Oracle (presse-papiers)") { pasteOracleConfig() }
         field(c2, "tenancy", "Tenancy OCID", "ocid1.tenancy.oc1..…", mono = true)
         field(c2, "user", "User OCID", "ocid1.user.oc1..…", mono = true)
         field(c2, "region", "Région", "eu-paris-1")
         field(c2, "fingerprint", "Empreinte de la clé API", "Remplie automatiquement", mono = true)
-        field(c2, "key", "Clé privée API (PEM)", "-----BEGIN PRIVATE KEY-----", multiline = true, mono = true)
-        btn(c2, "📂 Importer un fichier de clé privée (.pem)") { importPem() }
-        btn(c2, "Sauvegarder la clé privée") { export("oci_api_private.pem", txt("key")) }
+        field(c2, "key", "Clé privée API (remplie par le cadre 1 ou « J'ai déjà une clé »)", "-----BEGIN PRIVATE KEY-----", multiline = true, mono = true)
+        btn(c2, "Enregistrer une copie de la clé privée") { export("oci_api_private.pem", txt("key")) }
         field(c2, "compartment", "Compartiment (optionnel)", "Vide = racine du locataire", mono = true)
 
         val c3 = card(s, "3 · Vérifie la connexion", "Il faut une connexion réussie pour continuer.")
@@ -745,6 +818,7 @@ class MainActivity : Activity() {
         val r = row(c1)
         btn(r, "Clé privée") { export("oci_ssh_key.pem", Store.get(this, "ssh_priv")) }
         btn(r, "Clé publique") { export("oci_ssh_key.pub", txt("ssh")) }
+        btn(c1, "📂 Importer ma clé publique SSH (fichier)") { importSshPub() }
 
         val c2 = card(s, "Sauvegarde")
         ackBox = CheckBox(this).apply {
